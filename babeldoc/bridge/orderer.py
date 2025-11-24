@@ -84,9 +84,9 @@ class ParagraphOrderer:
             if not meta.normalized_text:
                 continue
                 
-            # --- Strategy A: Exact Text Match ---
+            # --- Strategy A: Exact Text Match (Global Search) ---
             search_start = 0
-            candidates = []
+            global_candidates = []
             
             while True:
                 idx = marker_full_text.find(meta.normalized_text, search_start)
@@ -104,32 +104,24 @@ class ParagraphOrderer:
                         break
                 
                 if matched_block_order is not None:
-                    candidates.append((matched_block_order, matched_page_index))
+                    global_candidates.append((matched_block_order, matched_page_index))
                 
                 search_start = idx + 1
             
             best_order = None
             
-            if candidates:
-                # Disambiguate by Page Number
-                page_matches = [c for c in candidates if c[1] == meta.page_number]
-                if page_matches:
-                    if len(page_matches) == 1:
-                        best_order = page_matches[0][0]
-                    else:
-                        # Multiple matches on same page (repeated text).
-                        # Use Geometric Disambiguation
-                        best_order = self._disambiguate_by_geometry(meta, page_matches, block_list)
+            # 1. Try Exact Match on SAME Page
+            page_matches = [c for c in global_candidates if c[1] == meta.page_number]
+            if page_matches:
+                if len(page_matches) == 1:
+                    best_order = page_matches[0][0]
                 else:
-                    # Fallback: Pick closest page
-                    candidates.sort(key=lambda c: abs(c[1] - meta.page_number))
-                    best_order = candidates[0][0]
+                    # Multiple matches on same page -> Geometric Disambiguation
+                    best_order = self._disambiguate_by_geometry(meta, page_matches, block_list)
             
-            # --- Strategy B: Fuzzy Text Match (if Exact failed) ---
+            # 2. Try Fuzzy Match on SAME Page (if Exact failed)
             if best_order is None:
-                # Only search blocks on the same page to save time
                 page_blocks = [b for b in block_list if b.page_index == meta.page_number]
-                best_fuzzy_score = 0.0
                 best_fuzzy_order = None
                 
                 from difflib import SequenceMatcher
@@ -138,25 +130,19 @@ class ParagraphOrderer:
                     block_norm = normalize_text_for_matching(block.text)
                     if not block_norm: continue
                     
-                    # Check if meta text is roughly in block text
-                    # Quick check: is it a substring with minor errors?
                     if len(meta.normalized_text) < len(block_norm):
-                        # Use 'real_quick_ratio' first
                         matcher = SequenceMatcher(None, meta.normalized_text, block_norm)
                         if matcher.real_quick_ratio() > 0.5:
-                            # Look for best matching block
                             match = matcher.find_longest_match(0, len(meta.normalized_text), 0, len(block_norm))
-                            if match.size > len(meta.normalized_text) * 0.8: # 80% match
+                            if match.size > len(meta.normalized_text) * 0.8:
                                 best_fuzzy_order = block.order
                                 break
                 
                 if best_fuzzy_order is not None:
                     best_order = best_fuzzy_order
 
-            # --- Strategy C: Geometric Fallback (if Text failed) ---
+            # 3. Try Geometric Match on SAME Page (if Text failed)
             if best_order is None:
-                 # Find the Marker block that best overlaps with this paragraph
-                 # Only consider blocks on the same page
                  page_blocks = [b for b in block_list if b.page_index == meta.page_number]
                  best_ios = 0.0
                  best_geo_order = None
@@ -167,7 +153,6 @@ class ParagraphOrderer:
                          best_ios = ios
                          best_geo_order = block.order
                  
-                 # Threshold for geometric match: 50% of paragraph must be inside block
                  if best_ios > 0.5:
                      best_geo_order = best_geo_order
                      best_order = best_geo_order
@@ -175,6 +160,26 @@ class ParagraphOrderer:
                  else:
                      if meta.box:
                          logger.debug(f"Geometric failed: Best IoS={best_ios:.2f} for '{meta.normalized_text[:20]}...' at {meta.box}")
+
+            # 4. Fallback: Exact Match on DIFFERENT Page (Only if all local attempts failed)
+            if best_order is None and global_candidates:
+                # Pick closest page
+                global_candidates.sort(key=lambda c: abs(c[1] - meta.page_number))
+                best_candidate = global_candidates[0]
+                
+                page_diff = abs(best_candidate[1] - meta.page_number)
+                
+                # Heuristic 1: Reject short text on remote pages
+                if len(meta.normalized_text) < 5 and page_diff > 0:
+                    logger.debug(f"Rejecting remote match for short text '{meta.normalized_text}' on Page {best_candidate[1]} (Diff={page_diff})")
+                
+                # Heuristic 2: Reject matches that are too far away (likely headers/footers)
+                # Unless the text is very long (unique)
+                elif page_diff > 2 and len(meta.normalized_text) < 50:
+                    logger.debug(f"Rejecting remote match for header/footer candidate '{meta.normalized_text[:20]}...' on Page {best_candidate[1]} (Diff={page_diff})")
+                
+                else:
+                    best_order = best_candidate[0]
 
             if best_order is not None:
                 meta.read_order = best_order
