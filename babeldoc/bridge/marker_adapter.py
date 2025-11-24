@@ -151,19 +151,40 @@ class MarkerJSONExtractor:
             except ValueError:
                 logger.debug("Skip page without index: %s", page.get("id"))
                 continue
-            self._walk_block_tree(page.get("children") or [], page_index, blocks)
+            
+            # Extract page dimensions for coordinate flipping
+            # Marker usually provides 'polygon' or 'bbox' for the page
+            page_height = 0.0
+            page_bbox = page.get("bbox")
+            if page_bbox and len(page_bbox) == 4:
+                # bbox is [x1, y1, x2, y2]
+                page_height = page_bbox[3] - page_bbox[1]
+            
+            # Fallback if bbox is missing or invalid (assume A4 height as rough guess, or 0 to skip flip)
+            # But usually Marker provides it. If 0, we can't flip correctly.
+            if page_height <= 0:
+                # Try to get it from polygon
+                poly = page.get("polygon")
+                if poly and len(poly) >= 4:
+                     # y coords are at odd indices
+                     ys = poly[1::2]
+                     if ys:
+                         page_height = max(ys) - min(ys)
+            
+            self._walk_block_tree(page.get("children") or [], page_index, page_height, blocks)
         return blocks
 
     def _walk_block_tree(
         self,
         nodes: Iterable[dict[str, Any]],
         page_index: int,
+        page_height: float,
         blocks: list[MarkerBlock],
     ) -> None:
         for node in nodes:
             children = node.get("children")
             if children:
-                self._walk_block_tree(children, page_index, blocks)
+                self._walk_block_tree(children, page_index, page_height, blocks)
                 continue
 
             block_type = node.get("block_type")
@@ -177,6 +198,24 @@ class MarkerJSONExtractor:
             bbox = node.get("bbox")
             if not bbox or len(bbox) != 4:
                 continue
+            
+            # Coordinate Flip: Marker (Top-Left) -> BabelDOC (Bottom-Left)
+            # y_new = page_height - y_old
+            # We must swap y1 and y2 because y1 < y2 in Top-Left becomes y1 > y2 in Bottom-Left logic if we just subtract.
+            # Standard PDF Box: [x1, y1, x2, y2] where y1 is bottom, y2 is top.
+            # Marker Box: [x1, y1, x2, y2] where y1 is top, y2 is bottom.
+            
+            x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+            
+            if page_height > 0:
+                # Flip
+                new_y1 = page_height - y2  # The bottom edge in Marker becomes the bottom edge in PDF (lower value)
+                new_y2 = page_height - y1  # The top edge in Marker becomes the top edge in PDF (higher value)
+                final_bbox = (x1, new_y1, x2, new_y2)
+            else:
+                # No page height, can't flip. Keep as is (will fail geometric match)
+                final_bbox = (x1, y1, x2, y2)
+
             order = len(blocks) + 1
             blocks.append(
                 MarkerBlock(
@@ -184,12 +223,7 @@ class MarkerJSONExtractor:
                     block_id=node.get("id", f"node-{order}"),
                     block_type=block_type,
                     page_index=page_index,
-                    bbox=(
-                        float(bbox[0]),
-                        float(bbox[1]),
-                        float(bbox[2]),
-                        float(bbox[3]),
-                    ),
+                    bbox=final_bbox,
                     text=text,
                 )
             )

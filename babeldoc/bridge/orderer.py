@@ -84,9 +84,7 @@ class ParagraphOrderer:
             if not meta.normalized_text:
                 continue
                 
-            # Search for the paragraph text in the global marker text
-            # Strategy: Find all occurrences, then filter by Page Number constraint
-            
+            # --- Strategy A: Exact Text Match ---
             search_start = 0
             candidates = []
             
@@ -95,15 +93,10 @@ class ParagraphOrderer:
                 if idx == -1:
                     break
                 
-                # Found a match at idx. Determine which block it belongs to.
-                # We use the center of the match to decide ownership if it spans blocks
                 match_center = idx + len(meta.normalized_text) // 2
-                
                 matched_block_order = None
                 matched_page_index = -1
                 
-                # Binary search or linear scan (linear is fine for <10k blocks)
-                # Optimization: The map is sorted by start_index
                 for m_start, m_end, m_order, m_page in marker_text_map:
                     if m_start <= match_center < m_end:
                         matched_block_order = m_order
@@ -115,35 +108,74 @@ class ParagraphOrderer:
                 
                 search_start = idx + 1
             
-            # Select the best candidate
             best_order = None
             
-            if not candidates:
-                # No exact match found. 
-                # TODO: Implement fuzzy matching fallback here if needed.
-                # For now, we log and skip.
-                pass
-            elif len(candidates) == 1:
-                # Unique match
-                best_order = candidates[0][0]
-            else:
-                # Multiple matches. Disambiguate by Page Number.
-                # BabelDOC page_number is 0-based in our meta (we fixed it in _collect)
-                # Marker page_index is 0-based.
-                
-                # Filter by exact page match
+            if candidates:
+                # Disambiguate by Page Number
                 page_matches = [c for c in candidates if c[1] == meta.page_number]
-                
                 if page_matches:
-                    # If multiple matches on the same page, this is tricky (repeated text on same page).
-                    # We could use relative order of previous paragraphs, but for now take the first.
-                    best_order = page_matches[0][0]
+                    if len(page_matches) == 1:
+                        best_order = page_matches[0][0]
+                    else:
+                        # Multiple matches on same page (repeated text).
+                        # Use Geometric Disambiguation
+                        best_order = self._disambiguate_by_geometry(meta, page_matches, block_list)
                 else:
-                    # No match on the correct page? This implies a page mismatch between engines.
-                    # Fallback: Pick the candidate on the closest page.
+                    # Fallback: Pick closest page
                     candidates.sort(key=lambda c: abs(c[1] - meta.page_number))
                     best_order = candidates[0][0]
             
+            # --- Strategy B: Fuzzy Text Match (if Exact failed) ---
+            if best_order is None:
+                # Only search blocks on the same page to save time
+                page_blocks = [b for b in block_list if b.page_index == meta.page_number]
+                best_fuzzy_score = 0.0
+                best_fuzzy_order = None
+                
+                from difflib import SequenceMatcher
+                
+                for block in page_blocks:
+                    block_norm = normalize_text_for_matching(block.text)
+                    if not block_norm: continue
+                    
+                    # Check if meta text is roughly in block text
+                    # Quick check: is it a substring with minor errors?
+                    if len(meta.normalized_text) < len(block_norm):
+                        # Use 'real_quick_ratio' first
+                        matcher = SequenceMatcher(None, meta.normalized_text, block_norm)
+                        if matcher.real_quick_ratio() > 0.5:
+                            # Look for best matching block
+                            match = matcher.find_longest_match(0, len(meta.normalized_text), 0, len(block_norm))
+                            if match.size > len(meta.normalized_text) * 0.8: # 80% match
+                                best_fuzzy_order = block.order
+                                break
+                
+                if best_fuzzy_order is not None:
+                    best_order = best_fuzzy_order
+
+            # --- Strategy C: Geometric Fallback (if Text failed) ---
+            if best_order is None:
+                 # Find the Marker block that best overlaps with this paragraph
+                 # Only consider blocks on the same page
+                 page_blocks = [b for b in block_list if b.page_index == meta.page_number]
+                 best_ios = 0.0
+                 best_geo_order = None
+                 
+                 for block in page_blocks:
+                     ios = self._calculate_ios(meta.box, block.bbox)
+                     if ios > best_ios:
+                         best_ios = ios
+                         best_geo_order = block.order
+                 
+                 # Threshold for geometric match: 50% of paragraph must be inside block
+                 if best_ios > 0.5:
+                     best_geo_order = best_geo_order
+                     best_order = best_geo_order
+                     logger.debug(f"Geometric match: IoS={best_ios:.2f} for '{meta.normalized_text[:20]}...' -> Order {best_geo_order}")
+                 else:
+                     if meta.box:
+                         logger.debug(f"Geometric failed: Best IoS={best_ios:.2f} for '{meta.normalized_text[:20]}...' at {meta.box}")
+
             if best_order is not None:
                 meta.read_order = best_order
                 matched_count += 1
@@ -155,12 +187,57 @@ class ParagraphOrderer:
             (matched_count / len(metas) * 100) if metas else 0
         )
 
-        # 4. Interpolation (Optional but recommended)
-        # If we have [Match(10), Unmatched, Match(12)], the Unmatched is likely 11.
-        # Simple forward-fill or linear interpolation can help.
-        # For now, we leave them None, which means they sort to the end (or original position).
-        
         return metas
+
+    def _disambiguate_by_geometry(self, meta: ParagraphMeta, candidates: list[tuple[int, int]], block_list: list[MarkerBlock]) -> int:
+        """
+        If text appears multiple times on the same page, pick the instance 
+        whose Marker block is closest to the BabelDOC paragraph.
+        """
+        best_order = candidates[0][0]
+        best_score = -1.0
+        
+        for order, _ in candidates:
+            if 0 < order <= len(block_list):
+                block = block_list[order-1]
+                if block.order == order:
+                    # Use Intersection over Self (IoS) to favor containment
+                    score = self._calculate_ios(meta.box, block.bbox)
+                    if score > best_score:
+                        best_score = score
+                        best_order = order
+        
+        return best_order
+
+    def _calculate_ios(self, box1: Box | None, box2: tuple[float, float, float, float]) -> float:
+        """
+        Calculate Intersection over Self (Area of Box1).
+        This is better than IoU when Box1 (paragraph) is much smaller than Box2 (block).
+        Returns fraction of Box1 that is inside Box2.
+        """
+        if not box1: return 0.0
+        
+        # BabelDOC Box: x, y, x2, y2
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.x, box1.y, box1.x2, box1.y2
+        
+        # Marker Box: x1, y1, x2, y2
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2
+        
+        # Intersection
+        x_left = max(b1_x1, b2_x1)
+        y_bottom = max(b1_y1, b2_y1)
+        x_right = min(b1_x2, b2_x2)
+        y_top = min(b1_y2, b2_y2)
+        
+        if x_right < x_left or y_top < y_bottom:
+            return 0.0
+            
+        intersection_area = (x_right - x_left) * (y_top - y_bottom)
+        b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+        
+        if b1_area <= 1e-6: return 0.0
+        
+        return intersection_area / b1_area
 
     def _collect_paragraphs(
         self, document: il_version_1.Document, allowed_pages: set[int] | None

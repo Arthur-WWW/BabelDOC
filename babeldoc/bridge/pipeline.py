@@ -36,6 +36,8 @@ from .translation_importer import TranslationImporter
 from .translator import PassthroughTranslator, build_translator, translate_blocks
 
 logger = logging.getLogger(__name__)
+# Force debug logging for bridge modules
+logging.getLogger("babeldoc.bridge").setLevel(logging.DEBUG)
 
 
 class NoOpDocLayoutModel(DocLayoutModel):
