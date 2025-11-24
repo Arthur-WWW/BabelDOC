@@ -7,6 +7,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
+import json
 
 from marker.config.parser import ConfigParser
 from marker.models import create_model_dict
@@ -130,10 +131,17 @@ class MarkerJSONExtractor:
         )
         rendered = converter(pdf_path)
         if hasattr(rendered, "model_dump"):
-            return rendered.model_dump()
-        if isinstance(rendered, dict):
-            return rendered
-        raise RuntimeError("Unexpected Marker output type: %s" % type(rendered))
+            raw_data = rendered.model_dump()
+        elif isinstance(rendered, dict):
+            raw_data = rendered
+        else:
+            raise RuntimeError("Unexpected Marker output type: %s" % type(rendered))
+
+        json_path = self.marker_output_dir / f"{Path(pdf_path).stem}.marker.json"
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(raw_data, f, ensure_ascii=False, indent=2)
+
+        return raw_data
 
     def _flatten_blocks(self, json_data: dict[str, Any]) -> list[MarkerBlock]:
         blocks: list[MarkerBlock] = []
