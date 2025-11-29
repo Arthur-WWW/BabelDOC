@@ -166,7 +166,7 @@ def run_hybrid_pipeline(
         base_name = output_path.stem
         export_path, index_path = TranslationExporter(
             output_path.parent, base_name
-        ).export(ordered_metas)
+        ).export(ordered_metas, blocks)
         translation_path = Path(
             translation_input if translation_input else export_path
         )
